@@ -2,14 +2,30 @@
 
 import argparse
 
+include_shap = False
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Карточки SOC и прогнозы модели")
+    parser.add_argument("--port", type=int, default=5062)
+    parser.add_argument("--shap", action="store_true", help="Открыть задания 1, 2 и 3")
+    params = parser.parse_args()
+    include_shap = params.shap
+    if include_shap:
+        # На Windows LightGBM нужно загрузить до PyArrow.
+        try:
+            from explanations import Explanations
+        except ModuleNotFoundError as error:
+            parser.error(f"Не найден модуль {error.name}. Проверьте распаковку комплекта курса и установку requirements_shap.txt по README.")
+
 from flask import Flask, redirect
-from taipy.gui import Gui
+from taipy.gui import Gui, invoke_long_callback
 
 from overview import ALL, load_counts, month_choices, overview
 from quality import BASE, load_predictions, quality
 
 
 sections = [("overview", "Обзор"), ("quality", "Качество модели")]
+if include_shap:
+    sections.append(("explain", "Почему так?"))
 
 
 def page(active, content):
@@ -154,6 +170,96 @@ QUALITY_PAGE = page("quality", """
 """)
 
 
+EXPLAIN_PAGE = page("explain", """
+# Почему модель так решила?
+
+<|part|class_name=period|
+<|{x_selected}|selector|lov={x_options}|dropdown|label=Карточка и исход|on_change=select_card|>
+<|Набор № 2 · LightGBM v001|text|class_name=context|>
+|>
+<|{x_status}|text|class_name=status|>
+<|part|render={x_ready}|
+<|part|class_name=metrics|
+<|part|class_name=kpi primary|
+Исход проверки
+
+<|{x_outcome}|text|class_name=metric words|>
+
+<|{x_verdict}|text|>
+|>
+<|part|class_name=kpi|
+Оценка модели
+
+<|{x_probability}|text|class_name=metric|>
+
+<|{x_decision}|text|>
+|>
+<|part|class_name=kpi|
+Порог тревоги
+
+<|{x_threshold}|text|class_name=metric|>
+
+Порог учебной модели
+|>
+|>
+
+<|part|class_name=panel|
+## Что повлияло на решение?
+
+Каждая полоса показывает изменение балла: вправо он растёт, влево снижается. Пунктир обозначает порог тревоги, точка показывает итог.
+
+<|chart|figure={x_water}|height=548px|width=100%|>
+
+<|{x_note}|text|class_name=observation|>
+|>
+
+<|Как проверить расчёт по исходным полям|expandable|expanded=False|
+<|{x_address_check}|text|>
+
+<|{x_check}|text|>
+<|chart|figure={x_top}|height=400px|width=100%|>
+<|{x_table}|table|show_all|>
+|>
+|>
+
+<|part|class_name=comparisons|
+<|part|class_name=panel|
+## Какие поля важны для модели?
+
+Пять полей с наибольшим средним вкладом по модулю. Среди 320 карточек поровну примеров каждого исхода. При другом составе выборки порядок может измениться.
+
+<|chart|figure={x_global}|height=250px|width=100%|>
+|>
+<|part|class_name=panel|
+## Как меняется оценка с длиной алерта?
+
+Средняя оценка по 3 173 записям при заданной длине сообщения. Для одинаковой длины взято среднее опубликованных оценок.
+
+<|chart|figure={x_pdp}|height=250px|width=100%|>
+|>
+|>
+""")
+
+
+def apply_card(state, success, label, result=None):
+    if state.x_selected != label:
+        return
+    with state:
+        if success:
+            for name, value in result.items():
+                setattr(state, name, value)
+        state.x_ready = success
+        state.x_status = "" if success else "Расчёт не прошёл проверку. Повторно выберите карточку."
+
+
+def select_card(state, var_name, value):
+    if value in x_options:
+        with state:
+            state.x_ready = False
+            state.x_status = "Рассчитываем оценку и вклады признаков…"
+        invoke_long_callback(state, explanations.explain, (value,), apply_card, (value,))
+
+
 def change_period(state, var_name, value):
     if value in overview_months:
         with state:
@@ -170,9 +276,6 @@ def change_quality(state, var_name, value):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Карточки SOC и качество прогнозов")
-    parser.add_argument("--port", type=int, default=5062)
-    params = parser.parse_args()
     try:
         counts = load_counts()
         log = load_predictions()
@@ -189,6 +292,17 @@ if __name__ == "__main__":
     server = Flask(__name__)
     server.add_url_rule("/", "home", lambda: redirect("/overview"))
     pages = {"overview": PAGE, "quality": QUALITY_PAGE}
+    if include_shap:
+        try:
+            explanations = Explanations()
+        except FileNotFoundError as error:
+            parser.error(f"Не найден файл {error.filename}. Проверьте оба комплекта задания 3 по README.")
+        x_options = list(explanations.options)
+        x_selected = x_options[0]
+        x_global, x_pdp = explanations.global_fig, explanations.pdp_fig
+        x_ready, x_status = True, ""
+        globals().update(explanations.explain(x_selected))
+        pages["explain"] = EXPLAIN_PAGE
     gui = Gui(pages=pages, flask=server, css_file="style.css")
     gui.run(host="127.0.0.1", port=params.port, title="Анализ карточек SOC",
             dark_mode=False, use_reloader=False, run_browser=False)
