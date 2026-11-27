@@ -81,7 +81,74 @@ def category_errors(positives):
     else:
         key = categories.missed.idxmax()
         row = categories.loc[key]
-        finding = f"В категории «{key}» пропущено {number(row.missed)} из {number(row.actual)} подтверждённых инцидентов."
+        finding = (f"Больше всего пропусков по числу карточек в категории «{key}»: "
+                   f"{number(row.missed)} из {number(row.actual)} ({percent(row.missed, row.actual)}). "
+                   f"По всем категориям доля пропусков составляет {percent(categories.missed.sum(), len(positives))}.")
+    return fig, finding
+
+
+def weekly_errors(dates, verified):
+    days = dates.dt.tz_localize(None).dt.normalize()
+    week = days.dt.to_period("W-SUN")
+    periods = pd.period_range(week.min(), week.max(), freq="W-SUN")
+    incidents = verified.loc[verified.y.eq(1)]
+    weekly = pd.DataFrame({
+        "forecasts": week.value_counts(),
+        "known": verified.groupby(week).size(),
+        "confirmed": incidents.groupby(week).size(),
+        "missed": incidents.loc[~incidents.alert].groupby(week).size(),
+    }).reindex(periods).fillna(0).astype(int)
+
+    dates_shown, labels, rates, values = [], [], [], []
+    first, last = days.min(), days.max()
+    for row in weekly.itertuples():
+        start = max(first, row.Index.start_time)
+        end = min(last, row.Index.end_time)
+        span = f"с {start:%d.%m} по {end:%d.%m}"
+        dates_shown.append(span)
+        if row.confirmed:
+            detail = f"{number(row.missed)} из {number(row.confirmed)}"
+            rates.append(100 * row.missed / row.confirmed)
+            values.append(percent(row.missed, row.confirmed))
+        else:
+            detail = "0 подтверждённых" if row.known else "Нет известных исходов"
+            if not row.forecasts:
+                detail = "Нет прогнозов"
+            rates.append(None)
+            values.append("")
+        labels.append(f"{span}<br>{detail}")
+
+    fig = go.Figure(go.Bar(
+        x=rates, y=dates_shown, orientation="h", marker_color=ORANGE, width=0.48,
+        text=values, textposition="outside", cliponaxis=False, constraintext="none",
+        customdata=weekly[["missed", "confirmed"]].values.tolist(),
+        hovertemplate="%{y}<br>Пропущено %{customdata[0]} из %{customdata[1]} · %{text}<extra></extra>",
+    ))
+    chart_style(fig, 72 + 41 * len(weekly))
+    fig.update_layout(margin_r=62, uniformtext_minsize=12, uniformtext_mode="show")
+    fig.update_yaxes(type="category", tickvals=dates_shown, ticktext=labels,
+                     autorange="reversed", showgrid=False)
+    fig.update_xaxes(range=[0, 100], dtick=25, ticksuffix="%", side="top")
+    comparable = weekly.loc[weekly.confirmed.gt(0)]
+    if comparable.empty:
+        finding = "В выбранном периоде нет подтверждённых инцидентов. Долю пропусков посчитать нельзя."
+    else:
+        fractions = comparable.missed / comparable.confirmed
+
+        def describe(period):
+            row = comparable.loc[period]
+            span = dates_shown[weekly.index.get_loc(period)]
+            return f"{span} ({number(row.missed)} из {number(row.confirmed)}, {percent(row.missed, row.confirmed)})"
+
+        low, high = fractions.idxmin(), fractions.idxmax()
+        if len(comparable) == 1:
+            finding = f"Пропуски можно оценить только за неделю {describe(low)}."
+        elif fractions.min() == fractions.max():
+            finding = f"Во все недели с подтверждёнными инцидентами доля пропусков одинакова ({percent(comparable.missed.sum(), comparable.confirmed.sum())})."
+        else:
+            finding = (f"Самая высокая доля пропусков за неделю {describe(high)}. "
+                       f"Самая низкая за неделю {describe(low)}.")
+        finding += f" Недель с подтверждёнными инцидентами {len(comparable)} из {len(weekly)}."
     return fig, finding
 
 
@@ -104,6 +171,39 @@ def threshold_curve(data, selected):
     return fig
 
 
+def calibration(data):
+    edges = [0, .1, .3, .5, .7, .9, float("inf")]
+    bands = ["0 до 10%", "10 до 30%", "30 до 50%", "50 до 70%", "70 до 90%", "90 до 100%"]
+    cut = pd.cut(data.score, edges, labels=bands, right=False)
+    groups = data.groupby(cut, observed=True).agg(
+        score=("score", "mean"), incidents=("y", "sum"), total=("y", "size")
+    )
+    actual = 100 * groups.incidents / groups.total
+    details = [
+        f"Оценки от {band}<br>Средняя оценка: {percent(row.score, 1)}"
+        f"<br>Инциденты: {number(row.incidents)} из {number(row.total)} ({percent(row.incidents, row.total)})"
+        for band, row in groups.iterrows()
+    ]
+    fig = go.Figure(go.Scatter(x=[0, 100], y=[0, 100], mode="lines",
+                               line=dict(color="#9eafc1", dash="dot"), hoverinfo="skip"))
+    featured = "50 до 70%"
+    fig.add_scatter(x=(100 * groups.score).tolist(), y=actual.tolist(), mode="markers",
+                    marker=dict(size=12, color=[ORANGE if s == featured else BLUE for s in groups.index]),
+                    text=details, hovertemplate="%{text}<extra></extra>")
+    chart_style(fig, 310)
+    fig.update_xaxes(title_text="Средняя оценка модели", range=[-3, 103], dtick=25, ticksuffix="%")
+    fig.update_yaxes(title_text="Доля инцидентов", range=[-3, 103], dtick=25, ticksuffix="%")
+    if data.empty:
+        finding = "За выбранный период нет прогнозов с известным исходом."
+    elif featured in groups.index:
+        row = groups.loc[featured]
+        finding = (f"От 50% до 70%: средняя оценка {percent(row.score, 1)}. "
+                   f"Подтверждено {number(row.incidents)} из {number(row.total)} ({percent(row.incidents, row.total)}).")
+    else:
+        finding = "В диапазоне от 50% до 70% нет прогнозов с известным исходом."
+    return fig, finding
+
+
 def quality(log, month, threshold):
     threshold = int(threshold)
     if not 0 <= threshold <= 100:
@@ -122,7 +222,25 @@ def quality(log, month, threshold):
     base_fn = int((pos & data.y_pred.eq(0)).sum())
     base_fp = int((~pos & data.y_pred.eq(1)).sum())
     fig, finding = category_errors(data.loc[pos])
+    weekly_fig, weekly_text = weekly_errors(cohort.date, data)
+    calibration_fig, calibration_text = calibration(data)
+    positives = tp + fn
+    negatives = tn + fp
+    comparison = pd.DataFrame({
+        "Показатель": ["Верные решения", "Обнаружено инцидентов", "Пропущено инцидентов", "Ложные тревоги"],
+        "Модель": [percent(tp + tn, len(data)) if len(data) else "Нет данных", number(tp), number(fn), number(fp)],
+        "Всё легитимно": [percent(negatives, len(data)) if len(data) else "Нет данных",
+                          "0", number(positives), "0"],
+    })
     missed = f"{number(fn)} из {number(fn + tp)} · {percent(fn, fn + tp)}" if fn + tp else "Нет подтверждённых инцидентов"
+    workload = int(cohort.score.ge(threshold / 100).sum())
+    original_workload = int(cohort.y_pred.eq(1).sum())
+    scenario = (f"При пороге {threshold}% по всему журналу выбранного периода получается "
+                f"{number(workload)} тревог, из них {number(workload - tp - fp)} с неизвестным исходом. "
+                f"По проверяемым карточкам пропущено {number(fn)} инцидентов, ложных тревог {number(fp)}.")
+    if threshold != BASE:
+        scenario += (f" При 18% смена получила {number(original_workload)} тревог. "
+                     f"По проверяемым карточкам было {number(base_fn)} пропусков и {number(base_fp)} ложных тревог.")
     return {
         "q_threshold_label": f"Порог тревоги · {threshold}%",
         "q_fn": number(fn),
@@ -136,11 +254,8 @@ def quality(log, month, threshold):
                       f"Ещё для {number((cohort.has_card & ~eligible).sum())} исход не определён.",
         "q_missed": missed, "q_false": number(fp),
         "q_matrix": error_matrix(tn, fp, fn, tp), "q_groups": fig, "q_group_text": finding,
-        "q_curve": threshold_curve(data, threshold),
-        "q_scenario": (f"При исходном пороге 18% модель пропустила {number(base_fn)} инцидентов "
-                       f"и дала {number(base_fp)} ложных тревог."
-                       if threshold == BASE else
-                       f"При пороге {threshold}% модель пропускает {number(fn)} инцидентов "
-                       f"и даёт {number(fp)} ложных тревог. При 18% пропусков было {number(base_fn)}, "
-                       f"ложных тревог было {number(base_fp)}."),
+        "q_curve": threshold_curve(data, threshold), "q_weekly": weekly_fig, "q_weekly_text": weekly_text,
+        "q_calibration": calibration_fig, "q_calibration_text": calibration_text,
+        "q_comparison": comparison,
+        "q_scenario": scenario,
     }

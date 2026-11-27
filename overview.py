@@ -67,6 +67,86 @@ def chart_style(fig, height):
     return fig
 
 
+def load_handling(path=DATA):
+    cards = pd.read_parquet(path, columns=[
+        "EntityId", "Создан", "Вердикт", "Правило корреляции SIEM",
+        "Дата взятия в работу", "Дата закрытия (факт)",
+    ]).set_index("EntityId", verify_integrity=True)
+    created = cards["Создан"]
+    taken = cards["Дата взятия в работу"]
+    closed = cards["Дата закрытия (факт)"]
+    both = taken.notna() & closed.notna()
+    ordered = taken.ge(created) & closed.ge(taken)
+    verdict = cards["Вердикт"].fillna("").str.strip()
+    return pd.DataFrame({
+        "month": created.dt.tz_convert("Europe/Moscow").dt.strftime("%Y-%m"),
+        "fp": verdict.eq("False Positive"),
+        "missing_verdict": verdict.isin(["", "Не указан"]),
+        "rule": cards["Правило корреляции SIEM"],
+        "dates_missing": ~both,
+        "minutes": (closed - taken).dt.total_seconds().div(60).where(ordered),
+    })
+
+
+def handling_bars(counts, ticks, axis, height):
+    fig = go.Figure(go.Bar(
+        x=counts.tolist(), y=counts.index.tolist(), orientation="h", marker_color=BLUE,
+        text=[number(n) for n in counts], textposition="outside", cliponaxis=False,
+        hovertemplate="%{y}<br>Карточек: %{text}<extra></extra>",
+    ))
+    chart_style(fig, height)
+    fig.update_yaxes(type="category", tickvals=counts.index.tolist(), ticktext=ticks,
+                     autorange="reversed", showgrid=False)
+    fig.update_xaxes(title_text=axis, range=[0, 1.25 * max(1, counts.max())] if len(counts) else [0, 1],
+                     tickformat=",~f", nticks=4)
+    return fig
+
+
+def handling_summary(cards, month):
+    part = cards if month == ALL else cards.loc[cards.month.eq(month)]
+    false_alarms = part.loc[part.fp, "rule"]
+    names = false_alarms.str.split("~~||~~", regex=False).explode().str.strip().dropna()
+    pairs = names[names.ne("")].reset_index().drop_duplicates(["EntityId", "rule"])
+    ranked = pairs.groupby("rule", sort=True).size().sort_values(ascending=False, kind="stable").head(5)
+    missing_rule = len(false_alarms) - pairs.EntityId.nunique()
+    rule_ticks = [
+        "<br>".join(line.replace("_ ", "_") for line in wrap(name.replace("_", "_ "), 23))
+        for name in ranked.index
+    ]
+    lines = max((tick.count("<br>") + 1 for tick in rule_ticks), default=1)
+    rules_fig = handling_bars(ranked, rule_ticks, "Ложные тревоги",
+                              max(175, 65 + len(ranked) * (16 * lines + 9)))
+    if ranked.empty:
+        rules_fig.add_annotation(x=.5, y=.5, xref="paper", yref="paper", showarrow=False,
+                                 text="Нет ложных тревог с указанным правилом")
+    noise = (f"Вердикт False Positive у {number(len(false_alarms))} из {number(len(part))} карточек "
+             f"({percent(len(false_alarms), len(part))}). Без названия правила: {number(missing_rule)}.")
+    scan = part.loc[part.rule.eq("GL_FW_S04_Host_Port_Scan")]
+    scan_text = (f"Правило GL_FW_S04_Host_Port_Scan указано единственным в {number(len(scan))} карточках. "
+                 f"Без вердикта осталось {number(scan.missing_verdict.sum())}, "
+                 f"вердикт False Positive получили {number(scan.fp.sum())}."
+                 if len(scan) else "В этот период нет карточек с единственным правилом GL_FW_S04_Host_Port_Scan.")
+
+    minutes = part.minutes.dropna()
+    intervals = ["До 15 мин", "От 15 мин до 1 ч", "От 1 до 4 ч", "От 4 до 24 ч", "От 24 ч"]
+    bucket = pd.cut(minutes, [0, 15, 60, 240, 1440, float("inf")], labels=intervals, right=False)
+    distribution = bucket.value_counts(sort=False)
+    time_fig = handling_bars(distribution, intervals, "Карточки", 270)
+    if len(minutes):
+        median, p90 = minutes.quantile([.5, .9])
+        median_text = f"{median:.1f}".replace(".", ",")
+        p90_text = f"{p90:.1f}".replace(".", ",")
+        timing = f"Медиана {median_text} мин. 90% интервалов укладываются в {p90_text} мин."
+    else:
+        timing = "Нет карточек с измеримой длительностью."
+    missing_dates = int(part.dates_missing.sum())
+    coverage = (f"В расчёте {number(len(minutes))} из {number(len(part))} карточек. "
+                f"Хотя бы одна дата отсутствует у {number(missing_dates)}, "
+                f"порядок дат нарушен у {number(len(part) - len(minutes) - missing_dates)}.")
+    return {"rule_chart": rules_fig, "noise_summary": noise, "scan_text": scan_text, "time_chart": time_fig,
+            "time_summary": timing, "time_coverage": coverage}
+
+
 def ranking(top, column):
     rates = column == "rate"
     ranked = top.sort_values(column, ascending=True)
@@ -134,7 +214,7 @@ def overview(counts, month):
         "missing_metric": f"{number(missing)} · {percent(missing, total)}",
         "peak_text": f"Больше всего карточек поступило {date_label(peak_day)}. Всего {number(peak)}.",
         "kinds_text": f"На тип «{leading_name}» приходится {percent(top.at[leading, 'cards'], total)} карточек периода.",
-        "rates_text": f"«{high_name}». Без вердикта: {number(top.at[high, 'missing'])} "
-                      f"из {number(top.at[high, 'cards'])}.",
+        "rates_text": f"У типа «{high_name}» вердикт отсутствует у {number(top.at[high, 'missing'])} "
+                      f"из {number(top.at[high, 'cards'])} карточек ({percent(top.at[high, 'missing'], top.at[high, 'cards'])}).",
         "flow_figure": fig, "types_figure": ranking(top, "cards"), "rates_figure": ranking(top, "rate"),
     }
